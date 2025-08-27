@@ -1,3 +1,3 @@
-test_power is straight forward, and will give you the power consumption at multiple instants. The average value was used for our results. Simply replace the line regarding the GPU's architecture with the correct one and run it.
+Replace test.sh's architecture with your GPU's, and run it. Parse the output files or use bash to find the relevant sections and extract the relevant data.
 
-test
+test_power.sh can be run as is and will give you the power consumption at multiple instants, which you can then average out.
