@@ -31,8 +31,7 @@ This project is organized to separate the CUDA kernels from the testing harnesse
 
 ## Requirements
 
--   **CUDA Toolkit:** Version 12.x recommended.
--   **NVIDIA GPU:** An NVIDIA GPU with Tensor Cores and compute capability SM_90+ (Hopper, Blackwell) is required to run the code as-is.
+-   **NVIDIA GPU:** An NVIDIA GPU with Tensor Cores is required to run the code as-is.
 -   **Build Tools:** A C++ compiler (`g++`) and `make`.
 
 ## Build and Test Instructions
