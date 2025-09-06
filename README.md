@@ -88,11 +88,11 @@ The repository also includes `FlashAttentionInRegister.cu`, which provides a wor
 
 ## License
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+This project is licensed under the BSD 3-Clause Licence. See the `LICENSE` file for details.
 
 ## Citation
 
-If you use this work in your research, please cite the following paper:
+If you use this work in your research, please cite the following paper (Currently Awaiting Moderation):
 ```bibtex
 @misc{morales2025inregister,
       title={Accelerating Fused WMMA Operations via In-Register Data Permutation}, 
