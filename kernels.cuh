@@ -1,25 +1,12 @@
-#include <iostream>
-#include <vector>
-#include <random>
-#include <algorithm>
-#include <cmath>
-#include <cuda_runtime.h>
+#ifndef KERNELS_CUH
+#define KERNELS_CUH
+
 #include <cuda_bf16.h>
 #include <mma.h>
-#include <iomanip> 
-
-#define BLOCK_SIZE 16
-
-#define CUDA_CHECK(err) { \
-    cudaError_t err_ = (err); \
-    if (err_ != cudaSuccess) { \
-        std::cerr << "CUDA error in " << __FILE__ << " line " << __LINE__ \
-                  << ": " << cudaGetErrorString(err_) << std::endl; \
-        exit(EXIT_FAILURE); \
-    } \
-}
 
 using namespace nvcuda;
+
+#define BLOCK_SIZE 16
 
 __global__ void Frag_standard_baseline(const __nv_bfloat16* A, const __nv_bfloat16* B, float* out) {
     __shared__ float sD[BLOCK_SIZE][BLOCK_SIZE];
@@ -74,58 +61,9 @@ __global__ void Frag_swapped(const __nv_bfloat16* A, const __nv_bfloat16* B, flo
 
     if(threadIdx.x % 4 == 0){
         int row_group = threadIdx.x / 4;
-        
-        int row_idx_A = row_group;
-        int row_idx_B = row_group + 8;
-
-        out[row_idx_A] = max_A;
-        out[row_idx_B] = max_B;
+        out[row_group] = max_A;
+        out[row_group + 8] = max_B;
     }
 }
 
-// Ref CPU
-void cpu_reference(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& ref_out) {
-    std::vector<float> C(BLOCK_SIZE * BLOCK_SIZE);
-    for (int i = 0; i < BLOCK_SIZE; ++i) {
-        for (int j = 0; j < BLOCK_SIZE; ++j) {
-            float sum = 0.0f;
-            for (int k = 0; k < BLOCK_SIZE; ++k) {
-                sum += A[i * BLOCK_SIZE + k] * B[j * BLOCK_SIZE + k];
-            }
-            C[i * BLOCK_SIZE + j] = sum;
-        }
-    }
-
-    ref_out.resize(BLOCK_SIZE);
-    for (int i = 0; i < BLOCK_SIZE; ++i) {
-        float row_max = -INFINITY;
-        for (int j = 0; j < BLOCK_SIZE; ++j) {
-            row_max = fmaxf(row_max, C[i * BLOCK_SIZE + j]);
-        }
-        ref_out[i] = row_max;
-    }
-}
-
-int main(int argc, char **argv) {
-    if (argc < 2) return 1;
-    int kernel_choice = std::stoi(argv[1]);
-    __nv_bfloat16 *d_A, *d_B; float* d_out;
-    const int matrix_size = BLOCK_SIZE * BLOCK_SIZE;
-    const int output_size = BLOCK_SIZE;
-    CUDA_CHECK(cudaMalloc(&d_A, matrix_size * sizeof(__nv_bfloat16)));
-    CUDA_CHECK(cudaMalloc(&d_B, matrix_size * sizeof(__nv_bfloat16)));
-    CUDA_CHECK(cudaMalloc(&d_out, output_size * sizeof(float)));
-    dim3 gridDim(1, 1, 1);
-    dim3 blockDim(32, 1, 1);
-
-    if (kernel_choice == 1) {
-        Frag_standard_baseline<<<gridDim, blockDim>>>(d_A, d_B, d_out);
-    } else {
-        Frag_swapped<<<gridDim, blockDim>>>(d_A, d_B, d_out);
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // --- Nettoyage ---
-    CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_B)); CUDA_CHECK(cudaFree(d_out));
-    return 0;
-}
+#endif // KERNELS_CUH
