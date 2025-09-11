@@ -12,9 +12,9 @@ The performance of GPU kernels for AI, such as FlashAttention, is increasingly l
 
 | Benchmark Type                | Architecture      | Speedup vs. Shared Memory |
 | ----------------------------- | ----------------- | ------------------------- |
-| Micro-Benchmark (Core Op)     | NVIDIA RTX 5080   | **7.07x**                 |
+| Micro-Benchmark (Core Op)     | NVIDIA RTX 5080   | **5.5x**                 |
 | Micro-Benchmark (Core Op)     | NVIDIA H100       | **7.05x**                 |
-| End-to-End FA-1 Style Kernel  | NVIDIA RTX 5080   | **1.90x**                 |
+| End-to-End FA-1 Style Kernel  | NVIDIA RTX 5080   | **1.40x**                 |
 
 ## Project Structure
 
@@ -36,7 +36,7 @@ This project is organized to separate the CUDA kernels from the testing harnesse
 
 ## Build and Test Instructions
 
-### 1. Configuration
+###  Configuration
 
 Before compiling, open the `Makefile` and edit the `ARCH` variable to match your GPU's architecture (e.g., `-arch=sm_90a` for Hopper, `-arch=sm_120` for Blackwell).
 
@@ -84,7 +84,7 @@ make run_profiling
 
 ### A Note on the FlashAttention Kernel (`FlashAttentionInRegister.cu`)
 
-The repository also includes `FlashAttentionInRegister.cu`, which provides a working example of integrating the in-register technique into a full, end-to-end FlashAttention kernel. This implementation is based on the FA-1 architecture (no V-matrix double buffering, no warp specialization). While it served to produce the 1.90x speedup result, implementing the method in more complex, state-of-the-art kernels may require additional engineering.
+The repository also includes `FlashAttentionInRegister.cu`, which provides a working example of integrating the in-register technique into a full, end-to-end FlashAttention kernel. This implementation is based on the FA-1 architecture (no V-matrix double buffering, no warp specialization). While it served to produce the 1.40x speedup result, implementing the method in more complex, state-of-the-art kernels may require additional engineering.
 
 ## License
 
