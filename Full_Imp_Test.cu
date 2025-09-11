@@ -228,36 +228,34 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
 }
 
 __global__ void flash_attention_kernel_baseline_shared_mem(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V, __nv_bfloat16* out, 
-                                                           int seq_len, int d_model) {
+                               int seq_len, int d_model) {
+    // La déclaration des variables et les gardes de sortie sont identiques
     if (blockIdx.x*BLOCK_SIZE >= d_model || blockIdx.y*BLOCK_SIZE >= seq_len) return;
+    unsigned int* vals;
+    float max_A;
+    float max_B;
+    float max_A_i = -INFINITY;
+    float max_B_i = -INFINITY;
+    float sum_A;
+    float sum_B;
+    float sum_A_i = 0.0f;
+    float sum_B_i = 0.0f;
 
-    // ==============================================================================
-    //                       DÉCLARATIONS & INITIALISATIONS
-    // ==============================================================================
-    
-    // Mémoire partagée pour les matrices
+    // Déclarations en mémoire partagée identiques
     __shared__ __nv_bfloat16 sQ_full[BLOCK_SIZE][PADDED_D];
     __shared__ __nv_bfloat16 sK[2][BLOCK_SIZE][BLOCK_SIZE];
     __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
-
-    // NOUVEAU: Mémoire partagée pour le calcul du softmax
-    __shared__ float sS_tile[BLOCK_SIZE][BLOCK_SIZE]; // Pour stocker S_ij
-    __shared__ float row_m_stats[BLOCK_SIZE];         // Pour stocker les max (m_i) de chaque ligne
-    __shared__ float row_l_stats[BLOCK_SIZE];         // Pour stocker les normalisateurs (l_i) de chaque ligne
-
-    // Accumulateur de sortie O, identique à votre version
     __shared__ float s_O_accum[32][8];
+    
+    // MODIFICATION: Ajout des buffers en mémoire partagée pour le round-trip
+    __shared__ float sS[BLOCK_SIZE][BLOCK_SIZE]; // Pour stocker S_ij
+    __shared__ __nv_bfloat16 sP[BLOCK_SIZE][BLOCK_SIZE]; // Pour stocker P_ij
+    // Des buffers pour que les leaders de quads partagent les stats de ligne
+    __shared__ float row_maxes[BLOCK_SIZE];
+    __shared__ float row_sums[BLOCK_SIZE];
 
-    // Initialisation des statistiques et de l'accumulateur
-    if (threadIdx.x < BLOCK_SIZE) {
-        row_m_stats[threadIdx.x] = -INFINITY;
-        row_l_stats[threadIdx.x] = 0.0f;
-    }
-    for(int i = 0; i < 8; i++) {
-        s_O_accum[threadIdx.x][i] = 0.0f;
-    }
 
-    // Chargement initial de Q dans la mémoire partagée (identique)
+    // Le chargement de sQ_full est identique
     for(int i = 0; i < 256; i++) {
         int flat_idx = threadIdx.x + i * 32;
         int row = flat_idx / 512;
@@ -267,23 +265,30 @@ __global__ void flash_attention_kernel_baseline_shared_mem(__nv_bfloat16* Q, __n
         }
     }
 
-    // ==============================================================================
-    //                         BOUCLE PRINCIPALE FLASHATTENTION
-    // ==============================================================================
+    // L'initialisation de s_O_accum est identique
+    for(int i = 0; i < 8; i++) {
+        s_O_accum[threadIdx.x][i] = 0.0f;
+    }
+
+    // BOUCLE FLASH (externe) - Itère sur les blocs de K/V
     for (int j = 0; j < seq_len / BLOCK_SIZE; ++j) {
+
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> q_frag;
         wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::col_major> k_frag;
         wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> work_frag;
         wmma::fill_fragment(work_frag, 0.0f);
 
-        // Prologue et K-Pipelining (identique)
+        // Toute la logique de software-pipelining pour QK^T est IDENTIQUE
+        // A. PROLOGUE
         for(int i = 0; i < 8; i++) {
             int tile_idx = threadIdx.x + i * 32;
             int row_in_tile = tile_idx / BLOCK_SIZE;
             int col_in_tile = tile_idx % BLOCK_SIZE;
-            sK[0][row_in_tile][col_in_tile] = K[(j * BLOCK_SIZE + row_in_tile) * d_model + col_in_tile];
+            int global_K_row = j * BLOCK_SIZE + row_in_tile;
+            int global_K_col = 0 + col_in_tile;
+            sK[0][row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
         }
-
+        // B. BOUCLE PRINCIPALE
         for (int p = 0; p < d_model / BLOCK_SIZE - 1; ++p) {
             __syncthreads();
             int current_buf_idx = p % 2;
@@ -292,90 +297,104 @@ __global__ void flash_attention_kernel_baseline_shared_mem(__nv_bfloat16* Q, __n
                 int tile_idx = threadIdx.x + i * 32;
                 int row_in_tile = tile_idx / BLOCK_SIZE;
                 int col_in_tile = tile_idx % BLOCK_SIZE;
-                sK[next_buf_idx][row_in_tile][col_in_tile] = K[(j * BLOCK_SIZE + row_in_tile) * d_model + (p + 1) * BLOCK_SIZE + col_in_tile];
+                int global_K_row = j * BLOCK_SIZE + row_in_tile;
+                int global_K_col = (p + 1) * BLOCK_SIZE + col_in_tile;
+                sK[next_buf_idx][row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
             }
             wmma::load_matrix_sync(q_frag, &sQ_full[0][p * BLOCK_SIZE], PADDED_D);
             wmma::load_matrix_sync(k_frag, &sK[current_buf_idx][0][0], BLOCK_SIZE);
             wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
         }
-
+        // C. EPILOGUE
         int last_buf_idx = (d_model / BLOCK_SIZE - 1) % 2;
         wmma::load_matrix_sync(q_frag, &sQ_full[0][(d_model / BLOCK_SIZE - 1) * BLOCK_SIZE], PADDED_D);
         wmma::load_matrix_sync(k_frag, &sK[last_buf_idx][0][0], BLOCK_SIZE);
         wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
+        // ----- FIN DE LA SECTION QK^T -----
 
-        // Normalisation par sqrt(d_model) (identique)
+        // Mise à l'échelle identique
         for(int i = 0; i < 8; i++) {
             work_frag.x[i] *= 1.0f / sqrtf((float)d_model);
         }
 
-        // ==============================================================================
-        //               <<<< DEBUT DE LA SECTION MODIFIÉE >>>>
-        //               Calcul du Softmax via Mémoire Partagée
-        // ==============================================================================
+        // ---------- DEBUT DE LA SECTION MODIFIÉE (Shared Memory Round-trip) ----------
+        
+        // 1. Stocker S_ij de registres -> mémoire partagée (de-swizzling)
+        wmma::store_matrix_sync(&sS[0][0], work_frag, BLOCK_SIZE, wmma::mem_row_major);
+        __syncthreads(); // Coût de synchronisation 1
 
-        // 1. Stocker S_ij (work_frag) dans la mémoire partagée
-        wmma::store_matrix_sync(&sS_tile[0][0], work_frag, BLOCK_SIZE, wmma::mem_row_major);
-        __syncthreads();
+        // 2. Réduction (max, puis sum) en lisant la mémoire partagée
+        // Chaque quad (4 threads) est responsable de 2 lignes. Le thread 0 du quad fait le calcul.
+        int my_row_A = threadIdx.x / 4;
+        int my_row_B = my_row_A + 8;
 
-        // 2. Chaque thread (0-15) traite une ligne pour trouver m_ij et l_ij
-        if (threadIdx.x < BLOCK_SIZE) {
-            int row = threadIdx.x;
-            float m_ij = -INFINITY;
-            
-            // a. Trouver le max de la ligne (m_ij)
-            for (int col = 0; col < BLOCK_SIZE; ++col) {
-                m_ij = fmaxf(m_ij, sS_tile[row][col]);
+        if (threadIdx.x % 4 == 0) {
+            max_A = -INFINITY;
+            max_B = -INFINITY;
+            for (int k = 0; k < BLOCK_SIZE; ++k) {
+                max_A = fmaxf(max_A, sS[my_row_A][k]);
+                max_B = fmaxf(max_B, sS[my_row_B][k]);
             }
-
-            // b. Mettre à jour les statistiques globales m_i et l_i
-            float m_old = row_m_stats[row];
-            float m_new = fmaxf(m_old, m_ij);
-            
-            float l_old_rescaled = row_l_stats[row] * expf(m_old - m_new);
-
-            // c. Calculer la somme des exponentielles de la ligne (l_ij)
-            float l_ij = 0.0f;
-            for (int col = 0; col < BLOCK_SIZE; ++col) {
-                l_ij += expf(sS_tile[row][col] - m_new);
-            }
-            
-            float l_new = l_old_rescaled + l_ij;
-
-            // d. Mettre à jour et stocker les nouvelles statistiques
-            row_m_stats[row] = m_new;
-            row_l_stats[row] = l_new;
-
-            // e. Normaliser la ligne pour obtenir P_ij et la stocker
-            float inv_l_new = 1.0f / l_new;
-            for (int col = 0; col < BLOCK_SIZE; ++col) {
-                sS_tile[row][col] = expf(sS_tile[row][col] - m_new) * inv_l_new;
-            }
+            row_maxes[my_row_A] = max_A;
+            row_maxes[my_row_B] = max_B;
         }
-        __syncthreads();
+        __syncthreads(); // Coût de synchronisation 2 (pour partager les max)
 
-        // 3. Recharger P_ij dans un fragment pour la multiplication P_ij * V_j
+        // Tous les threads du quad récupèrent le max de leurs lignes
+        max_A = row_maxes[my_row_A];
+        max_B = row_maxes[my_row_B];
+
+        if (threadIdx.x % 4 == 0) {
+            sum_A = 0.0f;
+            sum_B = 0.0f;
+            for (int k = 0; k < BLOCK_SIZE; ++k) {
+                sum_A += expf(sS[my_row_A][k] - max_A);
+                sum_B += expf(sS[my_row_B][k] - max_B);
+            }
+            row_sums[my_row_A] = sum_A;
+            row_sums[my_row_B] = sum_B;
+        }
+        __syncthreads(); // Coût de synchronisation 3 (pour partager les sums)
+
+        // Tous les threads du quad récupèrent la somme de leurs lignes
+        sum_A = row_sums[my_row_A];
+        sum_B = row_sums[my_row_B];
+
+        // 3. Mise à jour des statistiques globales (IDENTIQUE AU CODE ORIGINAL)
+        float old_sum_A_i = sum_A_i;
+        float old_sum_B_i = sum_B_i;
+
+        sum_A_i = old_sum_A_i * expf(max_A_i - fmax(max_A_i, max_A)) + sum_A * expf(max_A - fmax(max_A_i, max_A));
+        sum_B_i = old_sum_B_i * expf(max_B_i - fmax(max_B_i, max_B)) + sum_B * expf(max_B - fmax(max_B_i, max_B));
+
+        // 4. Calculer P_ij et le stocker en mémoire partagée
+        // Chaque thread calcule les 8 éléments de P dont il est responsable
+        for (int i = 0; i < 8; i++) {
+            // Utilise les formules de mapping pour trouver la coordonnée (r,c) de chaque élément
+            int r = (threadIdx.x / 4) + (((i >> 1) & 1) * 8);
+            int c = ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8);
+            float s_val = sS[r][c];
+            float p_val;
+            if (r < 8) { // Ligne A
+                p_val = expf(s_val - max_A) / sum_A;
+            } else { // Ligne B
+                p_val = expf(s_val - max_B) / sum_B;
+            }
+            sP[r][c] = __float2bfloat16(p_val);
+        }
+        __syncthreads(); // Coût de synchronisation 4
+
+        // 5. Recharger P_ij de mémoire partagée -> registres (re-swizzling)
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> p_frag;
-        // La tuile sS_tile contient maintenant P_ij. On la charge en bfloat16.
-        // NOTE: Cette boucle de chargement est une simplification. Une version SOTA utiliserait des chargements plus larges.
-        // On convertit float -> bfloat16 avant de charger.
-        if (threadIdx.x < BLOCK_SIZE) {
-             for (int col = 0; col < BLOCK_SIZE; ++col) {
-                // Pour éviter les conflits de bancs, on ne réécrit pas en place dans sS_tile
-                // On peut utiliser sV temporairement car il n'est pas encore chargé.
-                sV[threadIdx.x][col] = __float2bfloat16(sS_tile[threadIdx.x][col]);
-             }
-        }
-        __syncthreads();
-        wmma::load_matrix_sync(p_frag, &sV[0][0], BLOCK_SIZE);
+        wmma::load_matrix_sync(p_frag, &sP[0][0], BLOCK_SIZE);
+        
+        // ---------- FIN DE LA SECTION MODIFIÉE ----------
 
 
-        // ==============================================================================
-        //                 <<<< FIN DE LA SECTION MODIFIÉE >>>>
-        // ==============================================================================
+        // La suite est de nouveau identique à votre code (chargement de V, etc.)
+        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> v_frag;
+        wmma::fill_fragment(work_frag, 0.0f); // Réinitialise l'accumulateur pour PV^T
 
-
-        // Chargement de V (identique, mais sV a été réutilisé, il faut le recharger)
         for(int i = 0; i < 8; i++) {
             int tile_idx = threadIdx.x + i * 32;
             int row_in_tile = tile_idx / BLOCK_SIZE;
@@ -389,62 +408,44 @@ __global__ void flash_attention_kernel_baseline_shared_mem(__nv_bfloat16* Q, __n
             }
         }
         __syncthreads();
-        
-        // Multiplication P_ij * V_j (identique)
-        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> v_frag;
-        wmma::fill_fragment(work_frag, 0.0f); // réinitialise l'accumulateur pour O_ij
-        wmma::load_matrix_sync(v_frag, &sV[0][0], BLOCK_SIZE);
+
+        wmma::load_matrix_sync(v_frag, &sV[0][0], 16);
         wmma::mma_sync(work_frag, p_frag, v_frag, work_frag);
-
-        // Mise à jour de l'accumulateur de sortie O
-        // Cette logique est complexe car s_O_accum est par thread, mais les stats sont par ligne.
-        for(int i = 0; i < 8; i++) {
-            // Chaque thread doit calculer à quelle ligne de la matrice il correspond
-            int row = (threadIdx.x / 4) + (((i >> 1) & 1) * 8);
-
-            float m_old = row_m_stats[row] - logf( (row_l_stats[row] / (row_l_stats[row] - logf(row_l_stats[row]))) ); // Approximation pour retrouver m_old
-            float l_old = row_l_stats[row] - logf(row_l_stats[row]); // Approximation pour retrouver l_old
-
-            // La formule exacte est complexe à inverser, on utilise une approche simplifiée de mise à l'échelle
-            // NOTE : Cette partie est difficile à rendre 100% "apple-to-apple" sans recoder entièrement la logique de O.
-            // On se concentre sur le coût relatif.
-            // Dans le doute, on applique une mise à l'échelle qui est mathématiquement correcte mais peut différer en impl.
-            // Simplification : la mise à jour de O a été faite avant. On stocke juste la nouvelle valeur.
-            // On saute la mise à jour complexe pour se concentrer sur le coût du softmax, mais dans un kernel réel,
-            // il faudrait la logique complète ici.
-        }
         
-        // Pour une comparaison juste, on doit conserver la même structure de mise à jour.
-        // On fait une passe pour mettre à jour O avec les stats de ligne.
-        __syncthreads(); // Assure que les stats sont visibles
+        // MODIFICATION: Deuxième round-trip pour mettre à jour s_O_accum sans permutation
+        // Stocker le résultat de PV^T
+        wmma::store_matrix_sync(&sS[0][0], work_frag, BLOCK_SIZE, wmma::mem_row_major);
+        __syncthreads(); // Coût de synchronisation 5
+
+        // Lire le résultat et mettre à jour s_O_accum
+        float m_new_A = fmaxf(max_A_i, max_A);
+        float m_new_B = fmaxf(max_B_i, max_B);
+
         for(int i = 0; i < 8; i++) {
-             int row = (threadIdx.x / 4) + (((i >> 1) & 1) * 8);
-             // On suppose que l'update de O a été faite lors du calcul de Pij. On saute cette étape pour simplifier
-             // le code de test, mais en production, il y aurait une logique ici.
-        }
-        // NOTE: On omet la logique complexe d'update de O car elle est dépendante du layout des données
-        // et le but est de comparer le coût du softmax (store, sync, reduce, load) vs (shfl_sync).
-        // La logique ci-dessus capture ce coût.
-        
-        // On va simplement ajouter le résultat au lieu de la mise à jour complexe
-         for(int i = 0; i < 8; i++) {
-            s_O_accum[threadIdx.x][i] += work_frag.x[i];
+            // On retrouve la coordonnée (r,c) pour lire la bonne valeur dans sS
+            int r = (threadIdx.x / 4) + (((i >> 1) & 1) * 8);
+            int c = ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8);
+            
+            if (r < 8) { // Ligne A
+                s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - m_new_A) 
+                                          + sS[r][c] * (sum_A / sum_A_i) * expf(max_A - m_new_A);
+            } else { // Ligne B
+                 s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - m_new_B) 
+                                          + sS[r][c] * (sum_B / sum_B_i) * expf(max_B - m_new_B);
+            }
         }
 
+        // Mise à jour de max_i identique
+        max_A_i = fmax(max_A_i, max_A);
+        max_B_i = fmax(max_B_i, max_B);
 
-        __syncthreads();
+        __syncthreads(); // Synchronisation finale de la boucle
     }
 
-    // Écriture finale de O (logique identique, mais sans la permutation finale de O)
+    // MODIFICATION: La permutation finale sur s_O_accum est supprimée.
+    // L'écriture en mémoire globale reste la même, car elle utilise déjà les formules de mapping.
     for(int i = 0; i < 8; i++) {
-        int row = (threadIdx.x / 4) + (((i >> 1) & 1) * 8);
-        int col = ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8);
-        int global_row = blockIdx.y * BLOCK_SIZE + row;
-        int global_col = blockIdx.x * BLOCK_SIZE + col;
-        
-        if (global_row < seq_len && global_col < d_model) {
-            out[global_row * d_model + global_col] = __float2bfloat16(s_O_accum[threadIdx.x][i]);
-        }
+        out[(blockIdx.y * 16 + (threadIdx.x / 4) + (((i >> 1) & 1) * 8)) * d_model + blockIdx.x * 16 + ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8)] = __float2bfloat16(s_O_accum[threadIdx.x][i]);
     }
 }
 
