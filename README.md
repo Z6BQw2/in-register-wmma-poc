@@ -15,6 +15,7 @@ The performance of GPU kernels for AI, such as FlashAttention, is increasingly l
 | Micro-Benchmark (Core Op)     | NVIDIA RTX 5080   | **5.5x**                 |
 | Micro-Benchmark (Core Op)     | NVIDIA H100       | **6.05x**                 |
 | End-to-End FA-1 Style Kernel  | NVIDIA RTX 5080   | **1.40x**                 |
+| End-to-End FA-1 Style Kernel  | NVIDIA H100   | **1.35x**                 |
 
 ## Project Structure
 
