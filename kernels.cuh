@@ -23,13 +23,21 @@ __global__ void Frag_standard_baseline(const __nv_bfloat16* A, const __nv_bfloat
     wmma::store_matrix_sync(&sD[0][0], acc_frag, BLOCK_SIZE, wmma::mem_row_major);
     __syncthreads();
 
-    if (threadIdx.x < BLOCK_SIZE) {
-        int my_row = threadIdx.x;
-        float row_max = -INFINITY;
-        for (int i = 0; i < BLOCK_SIZE; i++) {
-            row_max = fmaxf(row_max, sD[my_row][i]);
-        }
-        out[my_row] = row_max;
+    int lane = threadIdx.x;
+    int my_row = lane % 16;
+    int start_col = (lane < 16) ? 0 : 8;
+    
+    float local_max = -INFINITY;
+    for (int i = 0; i < 8; i++) {
+        local_max = fmaxf(local_max, sD[my_row][start_col + i]);
+    }
+
+    unsigned mask = (1u << lane) | (1u << (lane ^ 16));
+    float partner_max = __shfl_xor_sync(mask, local_max, 16);
+    float final_row_max = fmaxf(local_max, partner_max);
+
+    if (lane < 16) {
+        out[my_row] = final_row_max;
     }
 }
 
