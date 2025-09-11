@@ -194,12 +194,17 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         work_frag.x[3] = work_frag.x[5];
         work_frag.x[5] = temp_f;
 
+        float m_new_A = fmax(max_A_i, max_A);
+        float m_new_B = fmax(max_B_i, max_B);
+
         for(int i = 0; i < 4; ++i) {
-            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - fmax(max_A_i, max_A)) + work_frag.x[i] * (sum_A / sum_A_i);
+            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - m_new_A) 
+                                    + work_frag.x[i] * (sum_A / sum_A_i) * expf(max_A - m_new_A);
         }
 
         for(int i = 4; i < 8; ++i) {
-            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - fmax(max_B_i, max_B)) + work_frag.x[i] * (sum_B / sum_B_i);
+            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - m_new_B) 
+                                    + work_frag.x[i] * (sum_B / sum_B_i) * expf(max_B - m_new_B);
         }
 
         max_A_i = fmax(max_A_i, max_A);
