@@ -1,25 +1,138 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdio.h>
+#include "../kernels.cuh"
+
 #include <math.h>
 #include <mma.h>
 
 using namespace nvcuda;
 
 #define BLOCK_SIZE 16
+#define D_MODEL 512
 #define PADDED_D (512 + 8)
 
-__global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V, __nv_bfloat16* out, 
+__global__ void V6(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V, __nv_bfloat16* out, 
                                int seq_len, int d_model) {
-    // int bx = blockIdx.x;
-    // int by = blockIdx.y;
-    // int tx = threadIdx.x;
-    // int ty = threadIdx.y;
-    // int globRow = by*BLOCK_SIZE+ty;
-    // int globCol = bx*BLOCK_SIZE+tx;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int globRow = by*BLOCK_SIZE+ty;
+    int globCol = bx*BLOCK_SIZE+tx;
+    if (globRow >= seq_len || globCol >= d_model) return;
 
-    if (blockIdx.x*BLOCK_SIZE >= d_model || blockIdx.y*BLOCK_SIZE >= seq_len) return;
-    unsigned int* vals;
+    float accumulator = 0.0f;
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float l_i_dummy = 0.0f;
+    float O_accum = 0.0f;
+
+    __shared__ __nv_bfloat16 sQ[BLOCK_SIZE][PADDED_D];
+    __shared__ __nv_bfloat16 sK[2][BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ __nv_bfloat16 sP[BLOCK_SIZE][BLOCK_SIZE]; // Necessary because we tile_S is the wrong type, and wmma doesn't offer the possibility to convert it during loading
+    __shared__ float tile_S[BLOCK_SIZE][BLOCK_SIZE];
+
+    for (int i = tx; i < d_model; i += blockDim.x) {
+        sQ[ty][i] = Q[globRow * d_model + i];
+    }
+
+    //
+    for (int j = 0; j < seq_len / BLOCK_SIZE; ++j) {
+
+        wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> q_frag;
+        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> k_frag;
+        wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> work_frag;
+        wmma::fill_fragment(work_frag, 0.0f);
+
+        sK[0][tx][ty] = K[j * BLOCK_SIZE * d_model + ty * d_model + tx];
+
+        // S_ij
+        for (int p = 0; p < (d_model / BLOCK_SIZE) - 1; p++){
+            int current_buf = p % 2;
+            int next_buf = 1 - current_buf;
+            __syncthreads();
+
+            wmma::load_matrix_sync(q_frag, &sQ[0][p * BLOCK_SIZE], PADDED_D);
+            wmma::load_matrix_sync(k_frag, &sK[current_buf][0][0], BLOCK_SIZE);
+            
+            sK[next_buf][tx][ty] = K[(p + 1) * BLOCK_SIZE + j * BLOCK_SIZE * d_model + ty * d_model + tx];
+
+            wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
+        }
+
+        int last_buf_idx = (d_model / BLOCK_SIZE - 1) % 2;
+        wmma::load_matrix_sync(q_frag, &sQ[0][(d_model / BLOCK_SIZE - 1) * BLOCK_SIZE], PADDED_D);
+        wmma::load_matrix_sync(k_frag, &sK[last_buf_idx][0][0], BLOCK_SIZE);
+        wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
+
+        float scale = 1.0f / sqrtf((float)d_model);
+        for(int i = 0; i < 8; i++) work_frag.x[i] *= scale;
+
+        wmma::store_matrix_sync(&tile_S[0][0], work_frag, BLOCK_SIZE, wmma::mem_row_major);
+
+        accumulator = tile_S[ty][tx]; //Essential to calculate row-wise opperations, and to do it without storing, it would require an entire cycle of in-register de-swizzling, which brings us back to the same idea. 
+
+        __syncthreads();
+        float warp_val = accumulator;
+
+        // Cette boucle est maintenant une réduction sur 16 éléments
+        #pragma unroll
+        for (int offset=8; offset>0; offset/=2) {
+            warp_val = fmaxf(warp_val, __shfl_down_sync(0xFFFFFFFF, warp_val, offset));
+        }
+
+        // Le max est maintenant dans le thread tx=0 de chaque ligne.
+        // On doit le diffuser aux autres.
+        float m_ij = __shfl_sync(0xFFFFFFFF, warp_val, 0);
+
+        // --- 2. RÉDUCTION DE LA SOMME (l_ij) ---
+        float m_new = fmaxf(m_i, m_ij);
+        float exp_val = expf(accumulator - m_ij);
+        warp_val = exp_val;
+
+        #pragma unroll
+        for (int offset=8; offset>0; offset/=2) {
+            warp_val += __shfl_down_sync(0xFFFFFFFF, warp_val, offset);
+        }
+        float l_ij = __shfl_sync(0xFFFFFFFF, warp_val, 0);
+        
+        l_i = l_i * expf(m_i - fmaxf(m_i, m_ij)) + l_ij * expf(m_ij - fmaxf(m_i, m_ij));
+
+        wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> p_frag;
+        sP[ty][tx] = __float2bfloat16(exp_val);
+        __syncthreads();
+        wmma::load_matrix_sync(p_frag, &sP[0][0], 16);
+
+        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> v_frag;
+        sV[ty][tx] = V[ (j * BLOCK_SIZE + ty) * d_model + (blockIdx.x * BLOCK_SIZE + tx) ];
+        __syncthreads();
+        wmma::load_matrix_sync(v_frag, &sV[0][0], 16);
+
+        wmma::fill_fragment(work_frag, 0.0f);
+        accumulator = 0;
+
+        wmma::mma_sync(work_frag, p_frag, v_frag, work_frag);
+        wmma::store_matrix_sync(&tile_S[0][0], work_frag, BLOCK_SIZE, wmma::mem_row_major);
+
+        O_accum = O_accum * expf(m_i - fmaxf(m_i, m_ij)) * (l_i_dummy / l_i) + tile_S[ty][tx] * expf(m_ij - fmaxf(m_i, m_ij)) / l_i;
+
+        m_i = fmax(m_i, m_ij);
+        l_i_dummy = l_i;
+        accumulator = 0;
+    }
+    out[globRow * d_model + globCol] = (__nv_bfloat16)O_accum;
+}
+
+__global__ void V7(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V, __nv_bfloat16* out, 
+                               int seq_len, int d_model) {
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int lane_id = threadIdx.x;
+    // Et la garde devient :
+    if (by * BLOCK_SIZE >= seq_len || bx * BLOCK_SIZE >= d_model) return;
+    int global_row_start = by * BLOCK_SIZE;
     float max_A;
     float max_B;
     float max_A_i = -INFINITY;
@@ -29,71 +142,69 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     float sum_A_i = 0.0f;
     float sum_B_i = 0.0f;
 
-    __shared__ __nv_bfloat16 sQ_full[BLOCK_SIZE][PADDED_D];
-    __shared__ __nv_bfloat16 sK[2][BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ float s_O_accum[32][8];
-
-    for(int i = 0; i < 256; i++) {
-        int flat_idx = threadIdx.x + i * 32;
-        int row = flat_idx / 512;
-        int col = flat_idx % 512;
-        if(row < 16) {
-            sQ_full[row][col] = Q[(blockIdx.y * 16 + row) * d_model + col];
-        }
-    }
 
     for(int i = 0; i < 8; i++) {
         s_O_accum[threadIdx.x][i] = 0.0f;
     }
 
-    // BOUCLE FLASH (externe) - Itère sur les blocs de K/V
+    __shared__ __nv_bfloat16 sQ[BLOCK_SIZE][D_MODEL];
+    __shared__ __nv_bfloat16 sK[2][BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
+
+    #pragma unroll
+    for(int i = 0; i < (BLOCK_SIZE * d_model) / 32; i++) {
+        int flat_idx = lane_id + i * 32;
+        int row = flat_idx / d_model;
+        int col = flat_idx % d_model;
+        sQ[row][col] = Q[(global_row_start + row) * d_model + col];
+    }
+
+    //
     for (int j = 0; j < seq_len / BLOCK_SIZE; ++j) {
 
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> q_frag;
-        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::col_major> k_frag;
+        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> k_frag;
         wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> work_frag;
         wmma::fill_fragment(work_frag, 0.0f);
 
-        // PROLOGUE sK[0]
-        for(int i = 0; i < 8; i++) {
-            int tile_idx = threadIdx.x + i * 32;
-            int row_in_tile = tile_idx / BLOCK_SIZE;
-            int col_in_tile = tile_idx % BLOCK_SIZE;
-            int global_K_row = j * BLOCK_SIZE + row_in_tile;
-            int global_K_col = 0 + col_in_tile;
-            sK[0][row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
+        #pragma unroll
+        for (int i = 0; i < (BLOCK_SIZE * BLOCK_SIZE) / 32; ++i) { // 256 elem / 32 threads = 8 iter
+            int flat_idx = lane_id + i * 32;
+            int row_in_tile = flat_idx / BLOCK_SIZE;
+            int col_in_tile = flat_idx % BLOCK_SIZE;
+            sK[0][row_in_tile][col_in_tile] = K[(j * BLOCK_SIZE + row_in_tile) * d_model + col_in_tile];
         }
 
-        for (int p = 0; p < d_model / BLOCK_SIZE - 1; ++p) {
+        // S_ij
+        for (int p = 0; p < (d_model / BLOCK_SIZE) - 1; p++){
+            int current_buf = p % 2;
+            int next_buf = 1 - current_buf;
             __syncthreads();
 
-            int current_buf_idx = p % 2;
-            int next_buf_idx = 1 - current_buf_idx;
-
-            for(int i = 0; i < 8; i++) {
-                int tile_idx = threadIdx.x + i * 32;
-                int row_in_tile = tile_idx / BLOCK_SIZE;
-                int col_in_tile = tile_idx % BLOCK_SIZE;
-                int global_K_row = j * BLOCK_SIZE + row_in_tile;
-                int global_K_col = (p + 1) * BLOCK_SIZE + col_in_tile;
-                sK[next_buf_idx][row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
+            wmma::load_matrix_sync(q_frag, &sQ[0][p * BLOCK_SIZE], D_MODEL);
+            wmma::load_matrix_sync(k_frag, &sK[current_buf][0][0], BLOCK_SIZE);
+            
+            #pragma unroll
+            for (int i = 0; i < (BLOCK_SIZE * BLOCK_SIZE) / 32; ++i) {
+                int flat_idx = lane_id + i * 32;
+                int row_in_tile = flat_idx / BLOCK_SIZE;
+                int col_in_tile = flat_idx % BLOCK_SIZE;
+                sK[next_buf][row_in_tile][col_in_tile] = K[(j*BLOCK_SIZE + row_in_tile) * d_model + (p+1)*BLOCK_SIZE + col_in_tile];
             }
 
-            wmma::load_matrix_sync(q_frag, &sQ_full[0][p * BLOCK_SIZE], PADDED_D);
-            wmma::load_matrix_sync(k_frag, &sK[current_buf_idx][0][0], BLOCK_SIZE);
             wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
-
         }
 
         int last_buf_idx = (d_model / BLOCK_SIZE - 1) % 2;
-        wmma::load_matrix_sync(q_frag, &sQ_full[0][(d_model / BLOCK_SIZE - 1) * BLOCK_SIZE], PADDED_D);
+        wmma::load_matrix_sync(q_frag, &sQ[0][(d_model / BLOCK_SIZE - 1) * BLOCK_SIZE], D_MODEL);
         wmma::load_matrix_sync(k_frag, &sK[last_buf_idx][0][0], BLOCK_SIZE);
         wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
 
-        for(int i = 0; i < 8; i++) {
-            work_frag.x[i] *= 1.0f / sqrtf((float)d_model);
-        }
+        float scale = 1.0f / sqrtf((float)d_model);
+        for(int i = 0; i < 8; i++) work_frag.x[i] *= scale;
+
+        ///////////////////////////////////////////////////////////////////////////////////////
 
         float temp_f;
 
@@ -120,12 +231,20 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         max_A = fmaxf(max_A, partner_max_A);
         max_B = fmaxf(max_B, partner_max_B);
 
+        // --- 2. RÉDUCTION DE LA SOMME (l_ij) ---
+        float m_new_A = fmaxf(max_A_i, max_A);
+        float m_new_B = fmaxf(max_B_i, max_B);
+
         sum_A = 0.0f;
         sum_B = 0.0f;
+
+        #pragma unroll
         for(int i = 0; i < 4; ++i) {
             work_frag.x[i] = expf(work_frag.x[i] - max_A);
             sum_A += work_frag.x[i];
         }
+
+        #pragma unroll
         for(int i = 4; i < 8; ++i) {
             work_frag.x[i] = expf(work_frag.x[i] - max_B);
             sum_B += work_frag.x[i];
@@ -143,76 +262,70 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
         sum_A += partner_max_A;
         sum_B += partner_max_B; 
 
-        float old_sum_A_i = sum_A_i;
+        float old_sum_A_i = sum_A_i; ///Remb (assignation potentiellement inutile)
         float old_sum_B_i = sum_B_i;
 
-        sum_A_i = old_sum_A_i * expf(max_A_i - fmax(max_A_i, max_A)) + sum_A * expf(max_A - fmax(max_A_i, max_A));
-        sum_B_i = old_sum_B_i * expf(max_B_i - fmax(max_B_i, max_B)) + sum_B * expf(max_B - fmax(max_B_i, max_B));
-
+        sum_A_i = old_sum_A_i * expf(max_A_i - m_new_A) + sum_A * expf(max_A - m_new_A);
+        sum_B_i = old_sum_B_i * expf(max_B_i - m_new_B) + sum_B * expf(max_B - m_new_B);
+        
         wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> p_frag;
 
+        #pragma unroll
         for(int i = 0; i < 4; ++i) {
-            p_frag.x[i] = __float2bfloat16(work_frag.x[i] / sum_A);
+            p_frag.x[i] = __float2bfloat16(work_frag.x[i] / sum_A); //Remb (/sum)
         }
+
+        #pragma unroll
         for(int i = 4; i < 8; ++i) {
             p_frag.x[i] = __float2bfloat16(work_frag.x[i] / sum_B);
         }
 
-        vals = reinterpret_cast<unsigned int*>(p_frag.x); //Un swap pour 2 valeurs: La reinterprétation prend 2 bits soit deux bfloat16, ce qui permet un swap en une seule instruction. Y'a pas de petites économies :)
-        unsigned int temp = vals[1];
-        vals[1] = vals[2];
-        vals[2] = temp;
+        temp_f = p_frag.x[2];
+        p_frag.x[2] = p_frag.x[4];
+        p_frag.x[4] = temp_f;
+
+        temp_f = p_frag.x[3];
+        p_frag.x[3] = p_frag.x[5];
+        p_frag.x[5] = temp_f;
 
         wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> v_frag;
-        wmma::fill_fragment(work_frag, 0.0f);
-
-        for(int i = 0; i < 8; i++) {
-            int tile_idx = threadIdx.x + i * 32;
-            int row_in_tile = tile_idx / BLOCK_SIZE;
-            int col_in_tile = tile_idx % BLOCK_SIZE;
+        #pragma unroll
+        for (int i = 0; i < (BLOCK_SIZE * BLOCK_SIZE) / 32; ++i) { // 8 itérations
+            int flat_idx = lane_id + i * 32;
+            int row_in_tile = flat_idx / BLOCK_SIZE;
+            int col_in_tile = flat_idx % BLOCK_SIZE;
 
             int global_V_row = j * BLOCK_SIZE + row_in_tile;
+            int global_V_col = bx * BLOCK_SIZE + col_in_tile;
 
-            int global_V_col = blockIdx.x * BLOCK_SIZE + col_in_tile;
-
-            if (global_V_row < seq_len && global_V_col < d_model) {
-                sV[row_in_tile][col_in_tile] = V[global_V_row * d_model + global_V_col];
-            } else {
-                sV[row_in_tile][col_in_tile] = __float2bfloat16(0.0f);
-            }
+            sV[row_in_tile][col_in_tile] = V[global_V_row * d_model + global_V_col];
+            
         }
         __syncthreads();
-
         wmma::load_matrix_sync(v_frag, &sV[0][0], 16);
+
+        wmma::fill_fragment(work_frag, 0.0f);
+
         wmma::mma_sync(work_frag, p_frag, v_frag, work_frag);
 
-        temp_f = work_frag.x[2];
-        work_frag.x[2] = work_frag.x[4];
-        work_frag.x[4] = temp_f;
+        // O_accum = O_accum * expf(m_i - fmaxf(m_i, m_ij)) * (l_i_dummy / l_i) + tile_S[ty][tx] * expf(m_ij - fmaxf(m_i, m_ij)) / l_i;
 
-        temp_f = work_frag.x[3];
-        work_frag.x[3] = work_frag.x[5];
-        work_frag.x[5] = temp_f;
+        temp_f = work_frag.x[2]; work_frag.x[2] = work_frag.x[4]; work_frag.x[4] = temp_f;
+        temp_f = work_frag.x[3]; work_frag.x[3] = work_frag.x[5]; work_frag.x[5] = temp_f;
 
-        float m_new_A = fmax(max_A_i, max_A);
-        float m_new_B = fmax(max_B_i, max_B);
-
+        #pragma unroll
         for(int i = 0; i < 4; ++i) {
-            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - m_new_A) 
-                                    + work_frag.x[i] * (sum_A / sum_A_i) * expf(max_A - m_new_A);
+            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - fmax(max_A_i, max_A)) + work_frag.x[i] * (sum_A / sum_A_i);
         }
 
+        #pragma unroll
         for(int i = 4; i < 8; ++i) {
-            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - m_new_B) 
-                                    + work_frag.x[i] * (sum_B / sum_B_i) * expf(max_B - m_new_B);
+            s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - fmax(max_B_i, max_B)) + work_frag.x[i] * (sum_B / sum_B_i);
         }
 
-        max_A_i = fmax(max_A_i, max_A);
-        max_B_i = fmax(max_B_i, max_B);
-
-        __syncthreads();
+        max_A_i = m_new_A;
+        max_B_i = m_new_B;
     }
-
     float temp_f = s_O_accum[threadIdx.x][2];
     s_O_accum[threadIdx.x][2] = s_O_accum[threadIdx.x][4];
     s_O_accum[threadIdx.x][4] = temp_f;
@@ -222,228 +335,7 @@ __global__ void flash_attention_kernel(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_
     s_O_accum[threadIdx.x][5] = temp_f;
 
     // Écriture avec les formules de mapping inverse
-    for(int i = 0; i < 8; i++) {
-        out[(blockIdx.y * 16 + (threadIdx.x / 4) + (((i >> 1) & 1) * 8)) * d_model + blockIdx.x * 16 + ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8)] = __float2bfloat16(s_O_accum[threadIdx.x][i]);
-    }
-}
-
-__global__ void flash_attention_kernel_baseline_shared_mem(__nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V, __nv_bfloat16* out, 
-                               int seq_len, int d_model) {
-    // La déclaration des variables et les gardes de sortie sont identiques
-    if (blockIdx.x*BLOCK_SIZE >= d_model || blockIdx.y*BLOCK_SIZE >= seq_len) return;
-    unsigned int* vals;
-    float max_A;
-    float max_B;
-    float max_A_i = -INFINITY;
-    float max_B_i = -INFINITY;
-    float sum_A;
-    float sum_B;
-    float sum_A_i = 0.0f;
-    float sum_B_i = 0.0f;
-
-    // Déclarations en mémoire partagée identiques
-    __shared__ __nv_bfloat16 sQ_full[BLOCK_SIZE][PADDED_D];
-    __shared__ __nv_bfloat16 sK[2][BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ __nv_bfloat16 sV[BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ float s_O_accum[32][8];
-    
-    // MODIFICATION: Ajout des buffers en mémoire partagée pour le round-trip
-    __shared__ float sS[BLOCK_SIZE][BLOCK_SIZE]; // Pour stocker S_ij
-    __shared__ __nv_bfloat16 sP[BLOCK_SIZE][BLOCK_SIZE]; // Pour stocker P_ij
-    // Des buffers pour que les leaders de quads partagent les stats de ligne
-    __shared__ float row_maxes[BLOCK_SIZE];
-    __shared__ float row_sums[BLOCK_SIZE];
-
-
-    // Le chargement de sQ_full est identique
-    for(int i = 0; i < 256; i++) {
-        int flat_idx = threadIdx.x + i * 32;
-        int row = flat_idx / 512;
-        int col = flat_idx % 512;
-        if(row < 16) {
-            sQ_full[row][col] = Q[(blockIdx.y * 16 + row) * d_model + col];
-        }
-    }
-
-    // L'initialisation de s_O_accum est identique
-    for(int i = 0; i < 8; i++) {
-        s_O_accum[threadIdx.x][i] = 0.0f;
-    }
-
-    // BOUCLE FLASH (externe) - Itère sur les blocs de K/V
-    for (int j = 0; j < seq_len / BLOCK_SIZE; ++j) {
-
-        wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> q_frag;
-        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::col_major> k_frag;
-        wmma::fragment<wmma::accumulator, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, float> work_frag;
-        wmma::fill_fragment(work_frag, 0.0f);
-
-        // Toute la logique de software-pipelining pour QK^T est IDENTIQUE
-        // A. PROLOGUE
-        for(int i = 0; i < 8; i++) {
-            int tile_idx = threadIdx.x + i * 32;
-            int row_in_tile = tile_idx / BLOCK_SIZE;
-            int col_in_tile = tile_idx % BLOCK_SIZE;
-            int global_K_row = j * BLOCK_SIZE + row_in_tile;
-            int global_K_col = 0 + col_in_tile;
-            sK[0][row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
-        }
-        // B. BOUCLE PRINCIPALE
-        for (int p = 0; p < d_model / BLOCK_SIZE - 1; ++p) {
-            __syncthreads();
-            int current_buf_idx = p % 2;
-            int next_buf_idx = 1 - current_buf_idx;
-            for(int i = 0; i < 8; i++) {
-                int tile_idx = threadIdx.x + i * 32;
-                int row_in_tile = tile_idx / BLOCK_SIZE;
-                int col_in_tile = tile_idx % BLOCK_SIZE;
-                int global_K_row = j * BLOCK_SIZE + row_in_tile;
-                int global_K_col = (p + 1) * BLOCK_SIZE + col_in_tile;
-                sK[next_buf_idx][row_in_tile][col_in_tile] = K[global_K_row * d_model + global_K_col];
-            }
-            wmma::load_matrix_sync(q_frag, &sQ_full[0][p * BLOCK_SIZE], PADDED_D);
-            wmma::load_matrix_sync(k_frag, &sK[current_buf_idx][0][0], BLOCK_SIZE);
-            wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
-        }
-        // C. EPILOGUE
-        int last_buf_idx = (d_model / BLOCK_SIZE - 1) % 2;
-        wmma::load_matrix_sync(q_frag, &sQ_full[0][(d_model / BLOCK_SIZE - 1) * BLOCK_SIZE], PADDED_D);
-        wmma::load_matrix_sync(k_frag, &sK[last_buf_idx][0][0], BLOCK_SIZE);
-        wmma::mma_sync(work_frag, q_frag, k_frag, work_frag);
-        // ----- FIN DE LA SECTION QK^T -----
-
-        // Mise à l'échelle identique
-        for(int i = 0; i < 8; i++) {
-            work_frag.x[i] *= 1.0f / sqrtf((float)d_model);
-        }
-
-        // ---------- DEBUT DE LA SECTION MODIFIÉE (Shared Memory Round-trip) ----------
-        
-        // 1. Stocker S_ij de registres -> mémoire partagée (de-swizzling)
-        wmma::store_matrix_sync(&sS[0][0], work_frag, BLOCK_SIZE, wmma::mem_row_major);
-        __syncthreads(); // Coût de synchronisation 1
-
-        // 2. Réduction (max, puis sum) en lisant la mémoire partagée
-        // Chaque quad (4 threads) est responsable de 2 lignes. Le thread 0 du quad fait le calcul.
-        int my_row_A = threadIdx.x / 4;
-        int my_row_B = my_row_A + 8;
-
-        if (threadIdx.x % 4 == 0) {
-            max_A = -INFINITY;
-            max_B = -INFINITY;
-            for (int k = 0; k < BLOCK_SIZE; ++k) {
-                max_A = fmaxf(max_A, sS[my_row_A][k]);
-                max_B = fmaxf(max_B, sS[my_row_B][k]);
-            }
-            row_maxes[my_row_A] = max_A;
-            row_maxes[my_row_B] = max_B;
-        }
-        __syncthreads(); // Coût de synchronisation 2 (pour partager les max)
-
-        // Tous les threads du quad récupèrent le max de leurs lignes
-        max_A = row_maxes[my_row_A];
-        max_B = row_maxes[my_row_B];
-
-        if (threadIdx.x % 4 == 0) {
-            sum_A = 0.0f;
-            sum_B = 0.0f;
-            for (int k = 0; k < BLOCK_SIZE; ++k) {
-                sum_A += expf(sS[my_row_A][k] - max_A);
-                sum_B += expf(sS[my_row_B][k] - max_B);
-            }
-            row_sums[my_row_A] = sum_A;
-            row_sums[my_row_B] = sum_B;
-        }
-        __syncthreads(); // Coût de synchronisation 3 (pour partager les sums)
-
-        // Tous les threads du quad récupèrent la somme de leurs lignes
-        sum_A = row_sums[my_row_A];
-        sum_B = row_sums[my_row_B];
-
-        // 3. Mise à jour des statistiques globales (IDENTIQUE AU CODE ORIGINAL)
-        float old_sum_A_i = sum_A_i;
-        float old_sum_B_i = sum_B_i;
-
-        sum_A_i = old_sum_A_i * expf(max_A_i - fmax(max_A_i, max_A)) + sum_A * expf(max_A - fmax(max_A_i, max_A));
-        sum_B_i = old_sum_B_i * expf(max_B_i - fmax(max_B_i, max_B)) + sum_B * expf(max_B - fmax(max_B_i, max_B));
-
-        // 4. Calculer P_ij et le stocker en mémoire partagée
-        // Chaque thread calcule les 8 éléments de P dont il est responsable
-        for (int i = 0; i < 8; i++) {
-            // Utilise les formules de mapping pour trouver la coordonnée (r,c) de chaque élément
-            int r = (threadIdx.x / 4) + (((i >> 1) & 1) * 8);
-            int c = ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8);
-            float s_val = sS[r][c];
-            float p_val;
-            if (r < 8) { // Ligne A
-                p_val = expf(s_val - max_A) / sum_A;
-            } else { // Ligne B
-                p_val = expf(s_val - max_B) / sum_B;
-            }
-            sP[r][c] = __float2bfloat16(p_val);
-        }
-        __syncthreads(); // Coût de synchronisation 4
-
-        // 5. Recharger P_ij de mémoire partagée -> registres (re-swizzling)
-        wmma::fragment<wmma::matrix_a, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> p_frag;
-        wmma::load_matrix_sync(p_frag, &sP[0][0], BLOCK_SIZE);
-        
-        // ---------- FIN DE LA SECTION MODIFIÉE ----------
-
-
-        // La suite est de nouveau identique à votre code (chargement de V, etc.)
-        wmma::fragment<wmma::matrix_b, BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, __nv_bfloat16, wmma::row_major> v_frag;
-        wmma::fill_fragment(work_frag, 0.0f); // Réinitialise l'accumulateur pour PV^T
-
-        for(int i = 0; i < 8; i++) {
-            int tile_idx = threadIdx.x + i * 32;
-            int row_in_tile = tile_idx / BLOCK_SIZE;
-            int col_in_tile = tile_idx % BLOCK_SIZE;
-            int global_V_row = j * BLOCK_SIZE + row_in_tile;
-            int global_V_col = blockIdx.x * BLOCK_SIZE + col_in_tile;
-            if (global_V_row < seq_len && global_V_col < d_model) {
-                sV[row_in_tile][col_in_tile] = V[global_V_row * d_model + global_V_col];
-            } else {
-                sV[row_in_tile][col_in_tile] = __float2bfloat16(0.0f);
-            }
-        }
-        __syncthreads();
-
-        wmma::load_matrix_sync(v_frag, &sV[0][0], 16);
-        wmma::mma_sync(work_frag, p_frag, v_frag, work_frag);
-        
-        // MODIFICATION: Deuxième round-trip pour mettre à jour s_O_accum sans permutation
-        // Stocker le résultat de PV^T
-        wmma::store_matrix_sync(&sS[0][0], work_frag, BLOCK_SIZE, wmma::mem_row_major);
-        __syncthreads(); // Coût de synchronisation 5
-
-        // Lire le résultat et mettre à jour s_O_accum
-        float m_new_A = fmaxf(max_A_i, max_A);
-        float m_new_B = fmaxf(max_B_i, max_B);
-
-        for(int i = 0; i < 8; i++) {
-            // On retrouve la coordonnée (r,c) pour lire la bonne valeur dans sS
-            int r = (threadIdx.x / 4) + (((i >> 1) & 1) * 8);
-            int c = ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8);
-            
-            if (r < 8) { // Ligne A
-                s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_A_i / sum_A_i) * expf(max_A_i - m_new_A) 
-                                          + sS[r][c] * (sum_A / sum_A_i) * expf(max_A - m_new_A);
-            } else { // Ligne B
-                 s_O_accum[threadIdx.x][i] = s_O_accum[threadIdx.x][i] * (old_sum_B_i / sum_B_i) * expf(max_B_i - m_new_B) 
-                                          + sS[r][c] * (sum_B / sum_B_i) * expf(max_B - m_new_B);
-            }
-        }
-
-        // Mise à jour de max_i identique
-        max_A_i = fmax(max_A_i, max_A);
-        max_B_i = fmax(max_B_i, max_B);
-
-        __syncthreads(); // Synchronisation finale de la boucle
-    }
-
-    // MODIFICATION: La permutation finale sur s_O_accum est supprimée.
-    // L'écriture en mémoire globale reste la même, car elle utilise déjà les formules de mapping.
+    #pragma unroll
     for(int i = 0; i < 8; i++) {
         out[(blockIdx.y * 16 + (threadIdx.x / 4) + (((i >> 1) & 1) * 8)) * d_model + blockIdx.x * 16 + ((threadIdx.x % 4) * 2) + (i % 2) + (((i >> 2) & 1) * 8)] = __float2bfloat16(s_O_accum[threadIdx.x][i]);
     }
@@ -537,8 +429,10 @@ int main() {
     cudaMemcpy(d_K, h_K, size_bf16, cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V, size_bf16, cudaMemcpyHostToDevice);
 
+    const int BLOCK_SIZE_X = 16;
+    const int BLOCK_SIZE_Y = 16;
     dim3 blockDim(32, 1, 1);
-    dim3 gridDim((d_model + BLOCK_SIZE - 1) / BLOCK_SIZE, (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE, 1);
+    dim3 gridDim((d_model + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X, (seq_len + BLOCK_SIZE_Y - 1) / BLOCK_SIZE_Y, 1);
     
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -549,13 +443,13 @@ int main() {
     printf("\n--- Benchmarking In-Register Kernel ---\n");
     printf("Performing %d warm-up rounds...\n", warmup_rounds);
     for (int i = 0; i < warmup_rounds; ++i) {
-        flash_attention_kernel<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+        V7<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
     }
     cudaDeviceSynchronize();
 
     cudaEventRecord(start);
     for(int i = 0; i < timing_rounds; i++) {
-        flash_attention_kernel<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+        V7<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -567,13 +461,13 @@ int main() {
     printf("\n--- Benchmarking Shared Memory Baseline Kernel ---\n");
     printf("Performing %d warm-up rounds...\n", warmup_rounds);
     for (int i = 0; i < warmup_rounds; ++i) {
-        flash_attention_kernel_baseline_shared_mem<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+        V7<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
     }
     cudaDeviceSynchronize();
 
     cudaEventRecord(start);
     for(int i = 0; i < timing_rounds; i++) {
-        flash_attention_kernel_baseline_shared_mem<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+        V7<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -591,7 +485,7 @@ int main() {
     // --- 5. VÉRIFICATION DE LA JUSTESSE (uniquement pour le kernel In-Register) ---
     printf("--- Correctness Check (for In-Register Kernel vs CPU) ---\n");
     // On exécute le kernel in-register une dernière fois pour être sûr que d_out contient son résultat
-    flash_attention_kernel<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
+    V6<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_out, seq_len, d_model);
     cudaMemcpy(h_out_gpu, d_out, size_bf16, cudaMemcpyDeviceToHost);
     
     printf("Running CPU reference...\n");
